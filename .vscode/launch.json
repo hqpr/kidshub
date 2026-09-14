@@ -1,0 +1,32 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "API: FastAPI",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "uvicorn",
+      "args": ["backend.main:app", "--reload", "--port", "8000"],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "ADMIN_KEY": "tyts-local-7f29a4c8",
+        "DATABASE_URL": "postgresql://postgres:postgres@127.0.0.1:5432/kidshub"
+      },
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "UI: Vue",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "npm run dev",
+      "cwd": "${workspaceFolder}/frontend"
+    }
+  ],
+  "compounds": [
+    {
+      "name": "Тиц!: усе разом",
+      "configurations": ["API: FastAPI", "UI: Vue"],
+      "stopAll": true
+    }
+  ]
+}

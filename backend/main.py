@@ -2,26 +2,29 @@ import json
 import os
 import re
 import secrets
-import sqlite3
 import time
-from contextlib import asynccontextmanager, closing
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
 from threading import Lock
 from typing import Literal
 
+import psycopg
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
+from psycopg.rows import dict_row
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 ROOT = Path(__file__).resolve().parent.parent
-DB_PATH = Path(os.getenv("DATABASE_PATH", ROOT / "kidshub.db"))
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@127.0.0.1:5432/kidshub")
+DATABASE_SCHEMA = os.getenv("DATABASE_SCHEMA")
 ADMIN_KEY = os.getenv("ADMIN_KEY")
 SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+SCHEMA_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
 DEFAULT_THANK_YOU = "Дякуємо! Ваші відповіді збережено."
 FAILED_LOGINS = {}
 LOGIN_LOCK = Lock()
@@ -30,37 +33,27 @@ LOGIN_WINDOW = 900
 
 
 def connect():
-    connection = sqlite3.connect(DB_PATH)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
-    return connection
+    if DATABASE_SCHEMA and not SCHEMA_RE.fullmatch(DATABASE_SCHEMA):
+        raise RuntimeError("Некоректна назва схеми PostgreSQL")
+    options = f"-c search_path={DATABASE_SCHEMA}" if DATABASE_SCHEMA else None
+    return psycopg.connect(DATABASE_URL, row_factory=dict_row, connect_timeout=5, options=options)
 
 
 def init_db():
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with closing(connect()) as db:
-        db.executescript(
+    with connect() as db:
+        db.execute(
             """
             CREATE TABLE IF NOT EXISTS polls (
-                id INTEGER PRIMARY KEY,
+                id BIGSERIAL PRIMARY KEY,
                 slug TEXT NOT NULL UNIQUE,
                 title TEXT NOT NULL,
                 description TEXT NOT NULL DEFAULT '',
                 thank_you_text TEXT NOT NULL DEFAULT 'Дякуємо! Ваші відповіді збережено.',
-                response_type TEXT NOT NULL DEFAULT 'single' CHECK(response_type IN ('single', 'multiple', 'text')),
-                options TEXT NOT NULL DEFAULT '[]',
-                created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS responses (
-                id INTEGER PRIMARY KEY,
-                poll_id INTEGER NOT NULL REFERENCES polls(id) ON DELETE CASCADE,
-                name TEXT,
-                answer TEXT NOT NULL,
-                created_at TEXT NOT NULL
+                created_at TIMESTAMPTZ NOT NULL
             );
             CREATE TABLE IF NOT EXISTS questions (
-                id INTEGER PRIMARY KEY,
-                poll_id INTEGER NOT NULL REFERENCES polls(id) ON DELETE CASCADE,
+                id BIGSERIAL PRIMARY KEY,
+                poll_id BIGINT NOT NULL REFERENCES polls(id) ON DELETE CASCADE,
                 position INTEGER NOT NULL,
                 prompt TEXT NOT NULL,
                 description TEXT NOT NULL DEFAULT '',
@@ -69,46 +62,24 @@ def init_db():
                 UNIQUE(poll_id, position)
             );
             CREATE TABLE IF NOT EXISTS submissions (
-                id INTEGER PRIMARY KEY,
-                poll_id INTEGER NOT NULL REFERENCES polls(id) ON DELETE CASCADE,
+                id BIGSERIAL PRIMARY KEY,
+                poll_id BIGINT NOT NULL REFERENCES polls(id) ON DELETE CASCADE,
                 respondent_id TEXT NOT NULL,
                 name TEXT,
-                created_at TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL,
                 UNIQUE(poll_id, respondent_id)
             );
             CREATE TABLE IF NOT EXISTS answers (
-                id INTEGER PRIMARY KEY,
-                submission_id INTEGER NOT NULL REFERENCES submissions(id) ON DELETE CASCADE,
-                question_id INTEGER NOT NULL REFERENCES questions(id) ON DELETE CASCADE,
+                id BIGSERIAL PRIMARY KEY,
+                submission_id BIGINT NOT NULL REFERENCES submissions(id) ON DELETE CASCADE,
+                question_id BIGINT NOT NULL REFERENCES questions(id) ON DELETE CASCADE,
                 answer TEXT NOT NULL,
                 UNIQUE(submission_id, question_id)
             );
+            CREATE INDEX IF NOT EXISTS submissions_poll_id_idx ON submissions(poll_id);
+            CREATE INDEX IF NOT EXISTS answers_question_id_idx ON answers(question_id);
             """
         )
-        columns = {row["name"] for row in db.execute("PRAGMA table_info(polls)")}
-        if "thank_you_text" not in columns:
-            db.execute(
-                "ALTER TABLE polls ADD COLUMN thank_you_text TEXT NOT NULL DEFAULT 'Дякуємо! Ваші відповіді збережено.'"
-            )
-        legacy_polls = db.execute(
-            "SELECT p.* FROM polls p WHERE NOT EXISTS (SELECT 1 FROM questions q WHERE q.poll_id = p.id)"
-        ).fetchall()
-        for poll in legacy_polls:
-            question_id = db.execute(
-                "INSERT INTO questions (poll_id, position, prompt, description, response_type, options) VALUES (?, 0, ?, ?, ?, ?)",
-                (poll["id"], poll["title"], poll["description"], poll["response_type"], poll["options"]),
-            ).lastrowid
-            responses = db.execute("SELECT * FROM responses WHERE poll_id = ?", (poll["id"],)).fetchall()
-            for response in responses:
-                submission_id = db.execute(
-                    "INSERT INTO submissions (poll_id, respondent_id, name, created_at) VALUES (?, ?, ?, ?)",
-                    (poll["id"], f"legacy-{response['id']}", response["name"], response["created_at"]),
-                ).lastrowid
-                db.execute(
-                    "INSERT INTO answers (submission_id, question_id, answer) VALUES (?, ?, ?)",
-                    (submission_id, question_id, response["answer"]),
-                )
-        db.commit()
 
 
 @asynccontextmanager
@@ -258,7 +229,7 @@ def question_dict(row):
 
 def poll_dict(db, row):
     questions = db.execute(
-        "SELECT * FROM questions WHERE poll_id = ? ORDER BY position", (row["id"],)
+        "SELECT * FROM questions WHERE poll_id = %s ORDER BY position", (row["id"],)
     ).fetchall()
     return {
         "slug": row["slug"],
@@ -271,7 +242,7 @@ def poll_dict(db, row):
 
 
 def find_poll(db, slug):
-    row = db.execute("SELECT * FROM polls WHERE slug = ?", (slug,)).fetchone()
+    row = db.execute("SELECT * FROM polls WHERE slug = %s", (slug,)).fetchone()
     if not row:
         raise HTTPException(404, "Опитування не знайдено")
     return row
@@ -291,9 +262,16 @@ def validated_answer(question, payload):
     return json.dumps(selected, ensure_ascii=False)
 
 
+@app.get("/health")
+def health():
+    with connect() as db:
+        db.execute("SELECT 1")
+    return {"ok": True}
+
+
 @app.get("/api/latest-poll")
 def latest_poll():
-    with closing(connect()) as db:
+    with connect() as db:
         poll = db.execute("SELECT slug FROM polls ORDER BY created_at DESC, id DESC LIMIT 1").fetchone()
     if not poll:
         raise HTTPException(404, "Опитувань поки немає")
@@ -302,39 +280,38 @@ def latest_poll():
 
 @app.get("/api/polls/{slug}")
 def get_poll(slug: str):
-    with closing(connect()) as db:
+    with connect() as db:
         return poll_dict(db, find_poll(db, slug))
 
 
 @app.post("/api/polls/{slug}/responses", status_code=201)
 def submit_response(slug: str, payload: SubmissionCreate):
-    with closing(connect()) as db:
-        poll = find_poll(db, slug)
-        questions = db.execute(
-            "SELECT * FROM questions WHERE poll_id = ? ORDER BY position", (poll["id"],)
-        ).fetchall()
-        received = {answer.question_id: answer for answer in payload.answers}
-        if len(received) != len(payload.answers) or set(received) != {row["id"] for row in questions}:
-            raise HTTPException(422, "Дайте відповідь на кожне питання")
-        values = [(row["id"], validated_answer(row, received[row["id"]])) for row in questions]
-        try:
+    try:
+        with connect() as db:
+            poll = find_poll(db, slug)
+            questions = db.execute(
+                "SELECT * FROM questions WHERE poll_id = %s ORDER BY position", (poll["id"],)
+            ).fetchall()
+            received = {answer.question_id: answer for answer in payload.answers}
+            if len(received) != len(payload.answers) or set(received) != {row["id"] for row in questions}:
+                raise HTTPException(422, "Дайте відповідь на кожне питання")
+            values = [(row["id"], validated_answer(row, received[row["id"]])) for row in questions]
             submission_id = db.execute(
-                "INSERT INTO submissions (poll_id, respondent_id, name, created_at) VALUES (?, ?, ?, ?)",
-                (poll["id"], payload.respondent_id, payload.name, datetime.now(timezone.utc).isoformat()),
-            ).lastrowid
-            db.executemany(
-                "INSERT INTO answers (submission_id, question_id, answer) VALUES (?, ?, ?)",
+                "INSERT INTO submissions (poll_id, respondent_id, name, created_at) VALUES (%s, %s, %s, %s) RETURNING id",
+                (poll["id"], payload.respondent_id, payload.name, datetime.now(timezone.utc)),
+            ).fetchone()["id"]
+            db.cursor().executemany(
+                "INSERT INTO answers (submission_id, question_id, answer) VALUES (%s, %s, %s)",
                 [(submission_id, question_id, answer) for question_id, answer in values],
             )
-            db.commit()
-        except sqlite3.IntegrityError:
-            raise HTTPException(409, "Ви вже відповіли на це опитування")
+    except psycopg.errors.UniqueViolation:
+        raise HTTPException(409, "Ви вже відповіли на це опитування")
     return {"ok": True}
 
 
 @app.get("/api/admin/polls", dependencies=[Depends(require_admin)])
 def list_polls():
-    with closing(connect()) as db:
+    with connect() as db:
         rows = db.execute(
             "SELECT p.*, COUNT(s.id) AS response_count FROM polls p LEFT JOIN submissions s ON s.poll_id = p.id GROUP BY p.id ORDER BY p.id DESC"
         ).fetchall()
@@ -347,13 +324,13 @@ def list_polls():
 @app.post("/api/admin/polls", dependencies=[Depends(require_admin)], status_code=201)
 def create_poll(payload: PollCreate):
     try:
-        with closing(connect()) as db:
+        with connect() as db:
             poll_id = db.execute(
-                "INSERT INTO polls (slug, title, description, thank_you_text, response_type, options, created_at) VALUES (?, ?, ?, ?, 'single', '[]', ?)",
-                (payload.slug, payload.title, payload.description, payload.thank_you_text, datetime.now(timezone.utc).isoformat()),
-            ).lastrowid
-            db.executemany(
-                "INSERT INTO questions (poll_id, position, prompt, description, response_type, options) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO polls (slug, title, description, thank_you_text, created_at) VALUES (%s, %s, %s, %s, %s) RETURNING id",
+                (payload.slug, payload.title, payload.description, payload.thank_you_text, datetime.now(timezone.utc)),
+            ).fetchone()["id"]
+            db.cursor().executemany(
+                "INSERT INTO questions (poll_id, position, prompt, description, response_type, options) VALUES (%s, %s, %s, %s, %s, %s)",
                 [
                     (
                         poll_id,
@@ -366,8 +343,7 @@ def create_poll(payload: PollCreate):
                     for position, question in enumerate(payload.questions)
                 ],
             )
-            db.commit()
-    except sqlite3.IntegrityError:
+    except psycopg.errors.UniqueViolation:
         raise HTTPException(409, "Такий slug уже зайнятий")
     return {"slug": payload.slug}
 
@@ -375,98 +351,93 @@ def create_poll(payload: PollCreate):
 @app.patch("/api/admin/polls/{slug}", dependencies=[Depends(require_admin)])
 def update_poll(slug: str, payload: PollUpdate):
     try:
-        with closing(connect()) as db:
+        with connect() as db:
             updated = db.execute(
-                "UPDATE polls SET slug = ?, title = ?, description = ?, thank_you_text = ? WHERE slug = ?",
+                "UPDATE polls SET slug = %s, title = %s, description = %s, thank_you_text = %s WHERE slug = %s",
                 (payload.slug, payload.title, payload.description, payload.thank_you_text, slug),
             )
             if not updated.rowcount:
                 raise HTTPException(404, "Форму не знайдено")
-            db.commit()
-    except sqlite3.IntegrityError:
+    except psycopg.errors.UniqueViolation:
         raise HTTPException(409, "Такий slug уже зайнятий")
     return {"slug": payload.slug}
 
 
 @app.delete("/api/admin/polls/{slug}", dependencies=[Depends(require_admin)], status_code=204)
 def delete_poll(slug: str):
-    with closing(connect()) as db:
-        deleted = db.execute("DELETE FROM polls WHERE slug = ?", (slug,))
+    with connect() as db:
+        deleted = db.execute("DELETE FROM polls WHERE slug = %s", (slug,))
         if not deleted.rowcount:
             raise HTTPException(404, "Форму не знайдено")
-        db.commit()
     return Response(status_code=204)
 
 
 @app.post("/api/admin/polls/{slug}/questions", dependencies=[Depends(require_admin)], status_code=201)
 def add_question(slug: str, payload: QuestionCreate):
-    with closing(connect()) as db:
+    with connect() as db:
         poll = find_poll(db, slug)
         position = db.execute(
-            "SELECT COALESCE(MAX(position), -1) + 1 FROM questions WHERE poll_id = ?", (poll["id"],)
-        ).fetchone()[0]
+            "SELECT COALESCE(MAX(position), -1) + 1 AS position FROM questions WHERE poll_id = %s", (poll["id"],)
+        ).fetchone()["position"]
         question_id = db.execute(
-            "INSERT INTO questions (poll_id, position, prompt, description, response_type, options) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO questions (poll_id, position, prompt, description, response_type, options) VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
             (poll["id"], position, payload.prompt, payload.description, payload.response_type, json.dumps(payload.options, ensure_ascii=False)),
-        ).lastrowid
-        db.commit()
+        ).fetchone()["id"]
     return {"id": question_id}
 
 
 @app.patch("/api/admin/questions/{question_id}", dependencies=[Depends(require_admin)])
 def update_question(question_id: int, payload: QuestionCreate):
-    with closing(connect()) as db:
-        question = db.execute("SELECT * FROM questions WHERE id = ?", (question_id,)).fetchone()
+    with connect() as db:
+        question = db.execute("SELECT * FROM questions WHERE id = %s", (question_id,)).fetchone()
         if not question:
             raise HTTPException(404, "Питання не знайдено")
-        answer_count = db.execute("SELECT COUNT(*) FROM answers WHERE question_id = ?", (question_id,)).fetchone()[0]
+        answer_count = db.execute("SELECT COUNT(*) AS count FROM answers WHERE question_id = %s", (question_id,)).fetchone()["count"]
         options = json.dumps(payload.options, ensure_ascii=False)
         if answer_count and (payload.response_type != question["response_type"] or options != question["options"]):
             raise HTTPException(409, "Після отримання відповідей можна змінити лише текст питання та пояснення")
         db.execute(
-            "UPDATE questions SET prompt = ?, description = ?, response_type = ?, options = ? WHERE id = ?",
+            "UPDATE questions SET prompt = %s, description = %s, response_type = %s, options = %s WHERE id = %s",
             (payload.prompt, payload.description, payload.response_type, options, question_id),
         )
-        db.commit()
     return {"id": question_id}
 
 
 @app.delete("/api/admin/questions/{question_id}", dependencies=[Depends(require_admin)], status_code=204)
 def delete_question(question_id: int):
-    with closing(connect()) as db:
-        question = db.execute("SELECT * FROM questions WHERE id = ?", (question_id,)).fetchone()
+    with connect() as db:
+        question = db.execute("SELECT * FROM questions WHERE id = %s", (question_id,)).fetchone()
         if not question:
             raise HTTPException(404, "Питання не знайдено")
-        count = db.execute("SELECT COUNT(*) FROM questions WHERE poll_id = ?", (question["poll_id"],)).fetchone()[0]
+        count = db.execute("SELECT COUNT(*) AS count FROM questions WHERE poll_id = %s", (question["poll_id"],)).fetchone()["count"]
         if count == 1:
             raise HTTPException(409, "У формі має залишитися хоча б одне питання")
-        db.execute("DELETE FROM questions WHERE id = ?", (question_id,))
+        db.execute("DELETE FROM questions WHERE id = %s", (question_id,))
         db.execute(
-            "UPDATE questions SET position = position + 1000 WHERE poll_id = ? AND position > ?",
+            "UPDATE questions SET position = position + 1000 WHERE poll_id = %s AND position > %s",
             (question["poll_id"], question["position"]),
         )
         db.execute(
-            "UPDATE questions SET position = position - 1001 WHERE poll_id = ? AND position > ?",
+            "UPDATE questions SET position = position - 1001 WHERE poll_id = %s AND position > %s",
             (question["poll_id"], question["position"] + 1000),
         )
-        db.commit()
     return Response(status_code=204)
 
 
 @app.get("/api/admin/polls/{slug}/stats", dependencies=[Depends(require_admin)])
 def poll_stats(slug: str):
-    with closing(connect()) as db:
+    with connect() as db:
         poll = find_poll(db, slug)
         submissions = db.execute(
-            "SELECT * FROM submissions WHERE poll_id = ?", (poll["id"],)
+            "SELECT * FROM submissions WHERE poll_id = %s", (poll["id"],)
         ).fetchall()
         questions = db.execute(
-            "SELECT * FROM questions WHERE poll_id = ? ORDER BY position", (poll["id"],)
+            "SELECT * FROM questions WHERE poll_id = %s ORDER BY position", (poll["id"],)
         ).fetchall()
         question_stats = []
         for question in questions:
             rows = db.execute(
-                "SELECT a.answer, s.name, s.created_at FROM answers a JOIN submissions s ON s.id = a.submission_id WHERE a.question_id = ? ORDER BY s.id DESC",
+                "SELECT a.answer, s.name, s.created_at FROM answers a JOIN submissions s ON s.id = a.submission_id WHERE a.question_id = %s ORDER BY s.id DESC",
                 (question["id"],),
             ).fetchall()
             item = {**question_dict(question), "answer_count": len(rows), "distribution": [], "answers": []}
@@ -523,8 +494,8 @@ if DIST.exists():
         }
         clean_path = path.strip("/")
         if clean_path and "/" not in clean_path:
-            with closing(connect()) as db:
-                poll = db.execute("SELECT title, description FROM polls WHERE slug = ?", (clean_path,)).fetchone()
+            with connect() as db:
+                poll = db.execute("SELECT title, description FROM polls WHERE slug = %s", (clean_path,)).fetchone()
             if poll:
                 values["title"] = f"{poll['title']} — Тиц!"
                 values["description"] = poll["description"] or "Поділіться своєю думкою в короткому опитуванні Kids Hub."

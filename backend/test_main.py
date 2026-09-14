@@ -1,29 +1,40 @@
-import importlib
 import os
-import tempfile
+import secrets
 import unittest
-from pathlib import Path
 
+import psycopg
 from fastapi.testclient import TestClient
+from psycopg import sql
+
+import backend.main
 
 
+TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL")
+
+
+@unittest.skipUnless(TEST_DATABASE_URL, "TEST_DATABASE_URL не задано")
 class AppTest(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        os.environ["DATABASE_PATH"] = str(Path(self.temp.name) / "test.db")
-        os.environ["ADMIN_KEY"] = "secret-key-123"
-        import backend.main
-
-        self.main = importlib.reload(backend.main)
+        self.schema = f"test_{secrets.token_hex(8)}"
+        with psycopg.connect(TEST_DATABASE_URL, autocommit=True) as db:
+            db.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(self.schema)))
+        self.main = backend.main
+        self.main.DATABASE_URL = TEST_DATABASE_URL
+        self.main.DATABASE_SCHEMA = self.schema
+        self.main.ADMIN_KEY = "secret-key-123"
+        self.main.FAILED_LOGINS.clear()
         self.client_context = TestClient(self.main.app)
         self.client = self.client_context.__enter__()
         self.headers = {"X-Admin-Key": "secret-key-123"}
 
     def tearDown(self):
         self.client_context.__exit__(None, None, None)
-        self.temp.cleanup()
+        with psycopg.connect(TEST_DATABASE_URL, autocommit=True) as db:
+            db.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(self.schema)))
+        self.main.DATABASE_SCHEMA = None
 
     def test_form_flow(self):
+        self.assertEqual(self.client.get("/health").json(), {"ok": True})
         created = self.client.post(
             "/api/admin/polls",
             headers=self.headers,
@@ -131,9 +142,11 @@ class AppTest(unittest.TestCase):
         self.assertEqual(renamed.status_code, 200)
         self.assertEqual(self.client.delete("/api/admin/polls/edited", headers=self.headers).status_code, 204)
 
+
+class SocialMetaTest(unittest.TestCase):
     def test_social_meta_is_dynamic_and_escaped(self):
         document = '<meta data-dynamic="title" content="old"><meta data-dynamic="url" content="old"><title>old</title>'
-        rendered = self.main.social_meta(document, {"title": 'Літо & "діти"', "url": "https://example.com/summer/"})
+        rendered = backend.main.social_meta(document, {"title": 'Літо & "діти"', "url": "https://example.com/summer/"})
         self.assertIn('content="Літо &amp; &quot;діти&quot;"', rendered)
         self.assertIn('content="https://example.com/summer/"', rendered)
         self.assertIn("<title>Літо &amp; &quot;діти&quot;</title>", rendered)
