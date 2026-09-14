@@ -57,7 +57,7 @@ def init_db():
                 position INTEGER NOT NULL,
                 prompt TEXT NOT NULL,
                 description TEXT NOT NULL DEFAULT '',
-                response_type TEXT NOT NULL CHECK(response_type IN ('single', 'multiple', 'text')),
+                response_type TEXT NOT NULL CONSTRAINT questions_response_type_check CHECK(response_type IN ('single', 'multiple', 'text', 'rating')),
                 options TEXT NOT NULL DEFAULT '[]',
                 UNIQUE(poll_id, position)
             );
@@ -78,6 +78,8 @@ def init_db():
             );
             CREATE INDEX IF NOT EXISTS submissions_poll_id_idx ON submissions(poll_id);
             CREATE INDEX IF NOT EXISTS answers_question_id_idx ON answers(question_id);
+            ALTER TABLE questions DROP CONSTRAINT IF EXISTS questions_response_type_check;
+            ALTER TABLE questions ADD CONSTRAINT questions_response_type_check CHECK(response_type IN ('single', 'multiple', 'text', 'rating'));
             """
         )
 
@@ -132,7 +134,7 @@ def require_admin(request: Request, x_admin_key: str = Header(default="", max_le
 class QuestionCreate(BaseModel):
     prompt: str = Field(min_length=2, max_length=200)
     description: str = Field(default="", max_length=500)
-    response_type: Literal["single", "multiple", "text"]
+    response_type: Literal["single", "multiple", "text", "rating"]
     options: list[str] = Field(default_factory=list, max_length=10)
 
     @field_validator("prompt", "description")
@@ -151,6 +153,11 @@ class QuestionCreate(BaseModel):
             raise ValueError("Варіанти не мають повторюватися")
         if self.response_type == "text":
             self.options = []
+        if self.response_type == "rating":
+            if not self.options:
+                self.options = ["5"]
+            if self.options not in [["5"], ["10"]]:
+                raise ValueError("Шкала оцінки має бути від 1 до 5 або від 1 до 10")
         return self
 
 
@@ -198,6 +205,7 @@ class PollUpdate(BaseModel):
 class AnswerCreate(BaseModel):
     question_id: int
     selected: list[str] = Field(default_factory=list, max_length=10)
+    rating: int | None = Field(default=None, ge=1, le=10, strict=True)
     text: str | None = Field(default=None, max_length=1000)
 
     @field_validator("text")
@@ -250,6 +258,11 @@ def find_poll(db, slug):
 
 def validated_answer(question, payload):
     options = json.loads(question["options"])
+    if question["response_type"] == "rating":
+        rating_max = int(options[0]) if options else 5
+        if payload.rating is None or payload.rating > rating_max:
+            raise HTTPException(422, f"Поставте оцінку: {question['prompt']}")
+        return json.dumps({"rating": payload.rating, "text": payload.text}, ensure_ascii=False)
     if question["response_type"] == "text":
         if not payload.text:
             raise HTTPException(422, f"Напишіть відповідь: {question['prompt']}")
@@ -440,9 +453,29 @@ def poll_stats(slug: str):
                 "SELECT a.answer, s.name, s.created_at FROM answers a JOIN submissions s ON s.id = a.submission_id WHERE a.question_id = %s ORDER BY s.id DESC",
                 (question["id"],),
             ).fetchall()
-            item = {**question_dict(question), "answer_count": len(rows), "distribution": [], "answers": []}
+            item = {**question_dict(question), "answer_count": len(rows), "distribution": [], "answers": [], "average_rating": None}
             if question["response_type"] == "text":
                 item["answers"] = [dict(row) for row in rows]
+            elif question["response_type"] == "rating":
+                ratings = []
+                rating_max = int(json.loads(question["options"])[0]) if question["options"] != "[]" else 5
+                counts = {score: 0 for score in range(rating_max, 0, -1)}
+                for row in rows:
+                    answer = json.loads(row["answer"])
+                    rating = answer["rating"]
+                    ratings.append(rating)
+                    counts[rating] += 1
+                    if answer.get("text"):
+                        item["answers"].append({**dict(row), "answer": answer["text"], "rating": rating})
+                item["average_rating"] = round(sum(ratings) / len(ratings), 2) if ratings else None
+                item["distribution"] = [
+                    {
+                        "option": str(score),
+                        "count": count,
+                        "percent": round(count * 100 / len(rows)) if rows else 0,
+                    }
+                    for score, count in counts.items()
+                ]
             else:
                 counts = {option: 0 for option in json.loads(question["options"])}
                 for row in rows:

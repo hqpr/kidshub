@@ -56,6 +56,12 @@ class AppTest(unittest.TestCase):
                         "response_type": "text",
                         "options": [],
                     },
+                    {
+                        "prompt": "Як вам подорож?",
+                        "description": "",
+                        "response_type": "rating",
+                        "options": ["10"],
+                    },
                 ],
             },
         )
@@ -70,6 +76,7 @@ class AppTest(unittest.TestCase):
                 "answers": [
                     {"question_id": questions[0]["id"], "selected": ["Море", "Гори"]},
                     {"question_id": questions[1]["id"], "text": "Сонце"},
+                    {"question_id": questions[2]["id"], "rating": 8, "text": "Майже ідеально"},
                 ],
             },
         )
@@ -79,6 +86,9 @@ class AppTest(unittest.TestCase):
         self.assertEqual(stats["named"], 1)
         self.assertEqual([item["count"] for item in stats["questions"][0]["distribution"]], [1, 1])
         self.assertEqual(stats["questions"][1]["answers"][0]["answer"], "Сонце")
+        self.assertEqual(stats["questions"][2]["average_rating"], 8)
+        self.assertEqual([item["count"] for item in stats["questions"][2]["distribution"]], [0, 0, 1, 0, 0, 0, 0, 0, 0, 0])
+        self.assertEqual(stats["questions"][2]["answers"][0]["answer"], "Майже ідеально")
         question_id = questions[0]["id"]
         edited = self.client.patch(
             f"/api/admin/questions/{question_id}",
@@ -159,6 +169,12 @@ class SocialMetaTest(unittest.TestCase):
         self.assertEqual(payload.slug, "summer-feedback")
         self.assertEqual(len(payload.questions), 19)
         self.assertEqual(payload.questions[2].response_type, "multiple")
+
+    def test_rating_respects_question_scale(self):
+        question = {"response_type": "rating", "options": '["5"]', "prompt": "Оцініть"}
+        with self.assertRaises(backend.main.HTTPException) as error:
+            backend.main.validated_answer(question, backend.main.AnswerCreate(question_id=1, rating=6))
+        self.assertEqual(error.exception.status_code, 422)
 
 
 if __name__ == "__main__":

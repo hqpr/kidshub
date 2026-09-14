@@ -27,9 +27,10 @@ const editingQuestionId = ref(null)
 const questionDraft = ref(null)
 const addingQuestion = ref(false)
 
-const newQuestion = () => ({ prompt: '', description: '', response_type: 'single', optionsText: 'Так\nНі\nЩе думаю' })
+const newQuestion = () => ({ prompt: '', description: '', response_type: 'single', optionsText: 'Так\nНі\nЩе думаю', ratingMax: 5 })
 const form = ref({ slug: '', title: '', description: '', thank_you_text: defaultThankYou, questions: [newQuestion()] })
-const typeLabels = { single: 'Один варіант', multiple: 'Кілька варіантів', text: 'Текстова відповідь' }
+const typeLabels = { single: 'Один варіант', multiple: 'Кілька варіантів', text: 'Текстова відповідь', rating: 'Оцінка + коментар' }
+const usesOptions = type => type === 'single' || type === 'multiple'
 const publicUrl = computed(() => selectedPoll.value ? `${window.location.origin}/${selectedPoll.value}/` : '')
 const reportUrl = computed(() => selectedPoll.value ? `/${adminPath}/stats/${selectedPoll.value}/` : '')
 const reportPoll = computed(() => polls.value.find(item => item.slug === selectedPoll.value))
@@ -37,7 +38,7 @@ const namedPercent = computed(() => stats.value?.total ? Math.round(stats.value.
 const anonymousPercent = computed(() => stats.value?.total ? 100 - namedPercent.value : 0)
 const donutBackground = computed(() => stats.value?.total ? `conic-gradient(#ef5f4c 0 ${namedPercent.value}%, #82d8c1 ${namedPercent.value}% 100%)` : '#dedbd3')
 const topAnswers = computed(() => (stats.value?.questions || []).flatMap((question, index) => {
-  if (!question.distribution.length) return []
+  if (question.response_type === 'rating' || !question.distribution.length) return []
   const top = question.distribution.reduce((best, item) => item.count > best.count ? item : best)
   return top.count ? [{ question: index + 1, prompt: question.prompt, ...top }] : []
 }))
@@ -81,7 +82,7 @@ async function loadPoll() {
       return
     }
     poll.value = await request(`/api/polls/${slug}`)
-    answers.value = Object.fromEntries(poll.value.questions.map(question => [question.id, { selected: [], text: '' }]))
+    answers.value = Object.fromEntries(poll.value.questions.map(question => [question.id, { selected: [], rating: null, text: '' }]))
     const draft = storedJson(draftKey)
     if (draft?.version === poll.value.created_at) {
       for (const question of poll.value.questions) {
@@ -105,6 +106,7 @@ function saveDraft() {
 
 function isAnswered(question) {
   const answer = answers.value[question.id]
+  if (question.response_type === 'rating') return Number.isInteger(answer?.rating)
   return question.response_type === 'text' ? Boolean(answer?.text?.trim()) : Boolean(answer?.selected?.length)
 }
 
@@ -120,7 +122,11 @@ function toggle(question, option) {
 async function next() {
   message.value = ''
   if (!isAnswered(currentQuestion.value)) {
-    message.value = currentQuestion.value.response_type === 'text' ? 'Напишіть відповідь, щоб продовжити.' : 'Оберіть варіант, щоб продовжити.'
+    message.value = currentQuestion.value.response_type === 'text'
+      ? 'Напишіть відповідь, щоб продовжити.'
+      : currentQuestion.value.response_type === 'rating'
+        ? 'Поставте оцінку, щоб продовжити.'
+        : 'Оберіть варіант, щоб продовжити.'
     return
   }
   if (currentStep.value < poll.value.questions.length - 1) {
@@ -219,14 +225,22 @@ function questionPayload(question) {
     prompt: question.prompt,
     description: question.description,
     response_type: question.response_type,
-    options: question.response_type === 'text' ? [] : question.optionsText.split('\n')
+    options: question.response_type === 'rating' ? [String(question.ratingMax || 5)] : usesOptions(question.response_type) ? question.optionsText.split('\n') : []
   }
+}
+
+function formatRating(value) {
+  return Number(value).toFixed(1).replace('.', ',')
+}
+
+function ratingMax(question) {
+  return Number(question.options?.[0] || question.ratingMax || 5)
 }
 
 function startQuestionEdit(question) {
   editingQuestionId.value = question.id
   addingQuestion.value = false
-  questionDraft.value = { ...question, optionsText: question.options.join('\n') }
+  questionDraft.value = { ...question, optionsText: question.options.join('\n'), ratingMax: ratingMax(question) }
 }
 
 async function savePack() {
@@ -375,22 +389,23 @@ onMounted(() => isManager ? (adminKey.value && login()) : loadPoll())
       <section class="report-section">
         <div class="report-section-head"><span>02</span><div><h2>Результати за питаннями</h2><p>Розподіл усіх отриманих відповідей</p></div></div>
         <div class="report-questions">
-          <article v-for="(question, index) in stats.questions" :key="question.id" class="report-question" :class="{ wide: question.response_type === 'text' }">
+          <article v-for="(question, index) in stats.questions" :key="question.id" class="report-question" :class="{ wide: ['text', 'rating'].includes(question.response_type) }">
             <div class="report-question-head">
               <span>{{ String(index + 1).padStart(2, '0') }}</span>
               <div><h3>{{ question.prompt }}</h3><p>{{ question.answer_count }} відповідей<span v-if="question.response_type === 'multiple'"> · можна було обрати кілька</span></p></div>
             </div>
+            <div v-if="question.response_type === 'rating' && question.average_rating !== null" class="rating-summary report-rating-summary"><strong>{{ formatRating(question.average_rating) }}</strong><span>середній бал<br>із {{ ratingMax(question) }}</span></div>
             <div v-if="question.distribution.length" class="report-bars">
               <div v-for="(item, itemIndex) in question.distribution" :key="item.option" class="report-bar-row">
                 <div class="report-bar-label"><span>{{ item.option }}</span><strong>{{ item.percent }}% <small>{{ item.count }}</small></strong></div>
                 <div class="report-bar-track"><i :class="`chart-color-${itemIndex % 4}`" :style="{ width: `${item.percent}%` }"></i></div>
               </div>
             </div>
-            <div v-else-if="question.answers.length" class="report-quotes">
-              <blockquote v-for="(item, answerIndex) in question.answers.slice(0, 8)" :key="answerIndex"><p>{{ item.answer }}</p><cite>{{ item.name || 'Анонімно' }}</cite></blockquote>
+            <div v-if="question.answers.length" class="report-quotes" :class="{ 'rating-quotes': question.response_type === 'rating' }">
+              <blockquote v-for="(item, answerIndex) in question.answers.slice(0, 8)" :key="answerIndex"><p>{{ item.answer }}</p><cite><template v-if="item.rating">{{ item.rating }}/{{ ratingMax(question) }} · </template>{{ item.name || 'Анонімно' }}</cite></blockquote>
               <p v-if="question.answers.length > 8" class="more-answers">Ще {{ question.answers.length - 8 }} відповідей у повній статистиці</p>
             </div>
-            <p v-else class="report-empty">Відповідей поки немає</p>
+            <p v-if="!question.distribution.length && !question.answers.length" class="report-empty">Відповідей поки немає</p>
           </article>
         </div>
       </section>
@@ -420,7 +435,8 @@ onMounted(() => isManager ? (adminKey.value && login()) : loadPoll())
             <label>Питання<input v-model="question.prompt" maxlength="200" placeholder="Куди хочете поїхати?" required></label>
             <label>Пояснення <small>необов’язково</small><input v-model="question.description" maxlength="500" placeholder="Уточніть, якщо потрібно"></label>
             <label>Тип<select v-model="question.response_type"><option v-for="(label, key) in typeLabels" :key="key" :value="key">{{ label }}</option></select></label>
-            <label v-if="question.response_type !== 'text'">Варіанти — кожен з нового рядка<textarea v-model="question.optionsText" rows="4" required></textarea></label>
+            <label v-if="question.response_type === 'rating'">Шкала<select v-model.number="question.ratingMax"><option :value="5">Від 1 до 5</option><option :value="10">Від 1 до 10</option></select></label>
+            <label v-if="usesOptions(question.response_type)">Варіанти — кожен з нового рядка<textarea v-model="question.optionsText" rows="4" required></textarea></label>
           </article>
           <button type="button" class="add-button" @click="addFormQuestion">+ Додати питання</button>
           <button class="create-button" :disabled="loading">{{ loading ? 'Створюю…' : 'Створити форму →' }}</button>
@@ -451,21 +467,23 @@ onMounted(() => isManager ? (adminKey.value && login()) : loadPoll())
                     <label>Питання<input v-model="questionDraft.prompt" maxlength="200" required></label>
                     <label>Пояснення<input v-model="questionDraft.description" maxlength="500"></label>
                     <label>Тип<select v-model="questionDraft.response_type"><option v-for="(label, key) in typeLabels" :key="key" :value="key">{{ label }}</option></select></label>
-                    <label v-if="questionDraft.response_type !== 'text'">Варіанти<textarea v-model="questionDraft.optionsText" rows="4" required></textarea></label>
+                    <label v-if="questionDraft.response_type === 'rating'">Шкала<select v-model.number="questionDraft.ratingMax"><option :value="5">Від 1 до 5</option><option :value="10">Від 1 до 10</option></select></label>
+                    <label v-if="usesOptions(questionDraft.response_type)">Варіанти<textarea v-model="questionDraft.optionsText" rows="4" required></textarea></label>
                     <div class="editor-actions"><button>Зберегти</button><button type="button" class="danger-button" @click="removeExistingQuestion(question.id)">Видалити питання</button></div>
                   </form>
                   <template v-else>
                     <h3>{{ question.prompt }}</h3>
+                    <div v-if="question.response_type === 'rating' && question.average_rating !== null" class="rating-summary"><strong>{{ formatRating(question.average_rating) }}</strong><span>середній бал із {{ ratingMax(question) }}</span></div>
                     <div v-if="question.distribution.length" class="bars">
                       <div v-for="item in question.distribution" :key="item.option" class="bar-row">
                         <div class="bar-label"><span>{{ item.option }}</span><b>{{ item.count }} · {{ item.percent }}%</b></div>
                         <div class="bar-track"><i :style="{ width: `${item.percent}%` }"></i></div>
                       </div>
                     </div>
-                    <div v-else-if="question.answers.length" class="text-answers">
-                      <article v-for="(item, answerIndex) in question.answers" :key="answerIndex"><p>{{ item.answer }}</p><span>{{ item.name || 'Анонімно' }}</span></article>
+                    <div v-if="question.answers.length" class="text-answers">
+                      <article v-for="(item, answerIndex) in question.answers" :key="answerIndex"><p>{{ item.answer }}</p><span><template v-if="item.rating">{{ item.rating }}/{{ ratingMax(question) }} · </template>{{ item.name || 'Анонімно' }}</span></article>
                     </div>
-                    <p v-else class="empty">Поки без відповідей.</p>
+                    <p v-if="!question.distribution.length && !question.answers.length" class="empty">Поки без відповідей.</p>
                   </template>
                 </article>
               </div>
@@ -474,7 +492,8 @@ onMounted(() => isManager ? (adminKey.value && login()) : loadPoll())
                 <label>Питання<input v-model="questionDraft.prompt" maxlength="200" required></label>
                 <label>Пояснення<input v-model="questionDraft.description" maxlength="500"></label>
                 <label>Тип<select v-model="questionDraft.response_type"><option v-for="(label, key) in typeLabels" :key="key" :value="key">{{ label }}</option></select></label>
-                <label v-if="questionDraft.response_type !== 'text'">Варіанти<textarea v-model="questionDraft.optionsText" rows="4" required></textarea></label>
+                <label v-if="questionDraft.response_type === 'rating'">Шкала<select v-model.number="questionDraft.ratingMax"><option :value="5">Від 1 до 5</option><option :value="10">Від 1 до 10</option></select></label>
+                <label v-if="usesOptions(questionDraft.response_type)">Варіанти<textarea v-model="questionDraft.optionsText" rows="4" required></textarea></label>
                 <div class="editor-actions"><button>Додати</button><button type="button" class="back-button" @click="addingQuestion = false">Скасувати</button></div>
               </form>
               <button v-else type="button" class="add-existing-button" @click="beginAddQuestion">+ Додати питання до форми</button>
@@ -501,7 +520,13 @@ onMounted(() => isManager ? (adminKey.value && login()) : loadPoll())
         <span class="eyebrow">Питання {{ currentStep + 1 }}</span>
         <h1>{{ currentQuestion.prompt }}</h1>
         <p v-if="currentQuestion.description" class="lead">{{ currentQuestion.description }}</p>
-        <div v-if="currentQuestion.response_type !== 'text'" class="choices">
+        <div v-if="currentQuestion.response_type === 'rating'" class="rating-answer">
+          <div class="rating-value"><strong>{{ answers[currentQuestion.id].rating || '—' }}</strong><span>із {{ ratingMax(currentQuestion) }}</span></div>
+          <input v-model.number="answers[currentQuestion.id].rating" class="rating-slider" :class="{ untouched: answers[currentQuestion.id].rating === null }" type="range" min="1" :max="ratingMax(currentQuestion)" step="1" aria-label="Оцінка" @input="message = ''">
+          <div class="rating-hints"><span>1 · Не сподобалось</span><span>{{ ratingMax(currentQuestion) }} · Чудово</span></div>
+          <label class="big-answer rating-comment">Коментар <small>необов’язково</small><textarea v-model="answers[currentQuestion.id].text" rows="4" maxlength="1000" placeholder="Що вплинуло на вашу оцінку?"></textarea></label>
+        </div>
+        <div v-else-if="currentQuestion.response_type !== 'text'" class="choices">
           <button v-for="(option, index) in currentQuestion.options" :key="option" type="button" class="choice" :class="{ chosen: answers[currentQuestion.id].selected.includes(option) }" @click="toggle(currentQuestion, option)">
             <span>{{ String(index + 1).padStart(2, '0') }}</span><b>{{ option }}</b><i>{{ answers[currentQuestion.id].selected.includes(option) ? '✓' : '→' }}</i>
           </button>
