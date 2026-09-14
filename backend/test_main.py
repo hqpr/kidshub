@@ -1,6 +1,7 @@
 import os
 import secrets
 import unittest
+from pathlib import Path
 
 import psycopg
 from fastapi.testclient import TestClient
@@ -150,6 +151,14 @@ class SocialMetaTest(unittest.TestCase):
         self.assertIn('content="Літо &amp; &quot;діти&quot;"', rendered)
         self.assertIn('content="https://example.com/summer/"', rendered)
         self.assertIn("<title>Літо &amp; &quot;діти&quot;</title>", rendered)
+
+    def test_summer_poll_json(self):
+        payload = backend.main.PollCreate.model_validate_json(
+            Path("data/summer-feedback.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(payload.slug, "summer-feedback")
+        self.assertEqual(len(payload.questions), 19)
+        self.assertEqual(payload.questions[2].response_type, "multiple")
 
 
 if __name__ == "__main__":

@@ -37,6 +37,14 @@ DATABASE_PUBLIC_URL='postgresql://…' python -m backend.migrate_sqlite
 
 Імпортер працює лише з порожньою PostgreSQL-базою. Після успішного перенесення Public Access бази можна вимкнути: застосунок використовує приватний `DATABASE_URL`.
 
+Якщо потрібно перенести лише форму без відповідей, у Railway задайте для одного деплою Pre-deploy Command:
+
+```bash
+python -m backend.import_poll data/summer-feedback.json
+```
+
+Після успішного деплою команду можна прибрати. Повторний запуск безпечний: наявне опитування з таким slug буде пропущено.
+
 ## Перевірка
 
 ```bash
