@@ -518,6 +518,10 @@ if DIST.exists():
     def og_cover():
         return FileResponse(DIST / "og-cover.png", media_type="image/png")
 
+    @app.get("/kids-hub-logo.png", include_in_schema=False)
+    def kids_hub_logo():
+        return FileResponse(DIST / "kids-hub-logo.png", media_type="image/png")
+
     @app.get("/{path:path}")
     def frontend(path: str, request: Request):
         origin = str(request.base_url).rstrip("/")
