@@ -527,7 +527,7 @@ if DIST.exists():
         origin = str(request.base_url).rstrip("/")
         values = {
             "url": str(request.url).split("?", 1)[0],
-            "image": f"{origin}/og-cover.png",
+            "image": f"{origin}/kids-hub-logo.png",
         }
         clean_path = path.strip("/")
         if clean_path and "/" not in clean_path:

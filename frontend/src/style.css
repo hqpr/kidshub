@@ -39,7 +39,7 @@ body::after { background: #82d8c1; right: -100px; bottom: -80px; border-radius: 
   height: 64px;
   overflow: hidden;
 }
-.brand-logo img { position: absolute; top: 50%; left: 50%; width: 300px; max-width: none; transform: translate(-50%, -50%); }
+.brand-logo img { position: absolute; top: calc(50% + 8px); left: 50%; width: 280px; max-width: none; transform: translate(-50%, -50%); }
 .tagline { margin-left: 18px; color: #6b706f; font-size: 14px; }
 
 h1, h2, p { margin-top: 0; }
@@ -201,7 +201,7 @@ button:disabled { opacity: .55; cursor: wait; transform: none; box-shadow: none;
 .report-hero h1 { max-width: 900px; margin: 20px 0 24px; font-size: clamp(58px, 7vw, 104px); line-height: .88; }
 .report-hero p { max-width: 720px; margin: 0; color: #d8ddd9; font-size: 20px; line-height: 1.5; }
 .report-logo { width: 176px; height: 61px; margin-bottom: 24px; }
-.report-logo img { width: 285px; }
+.report-logo img { width: 273px; }
 .report-kicker { color: #ffcd3c; font-size: 12px; font-weight: 850; letter-spacing: .13em; text-transform: uppercase; }
 .report-seal { display: grid; place-content: center; width: 190px; aspect-ratio: 1; color: #17212b; background: #ffcd3c; border-radius: 50%; text-align: center; transform: rotate(4deg); box-shadow: 10px 10px 0 #ef5f4c; }
 .report-seal strong { font-size: 72px; line-height: .85; letter-spacing: -.07em; }
