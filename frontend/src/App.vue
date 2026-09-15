@@ -329,7 +329,7 @@ onMounted(() => isManager ? (adminKey.value && login()) : loadPoll())
 <template>
   <main>
     <header v-if="!isStats" class="topbar">
-      <a class="brand" href="/">Тиц<span>!</span></a>
+      <a class="brand-logo" href="/"><img src="/kids-hub-logo.png" alt="Kids Hub"></a>
       <span class="tagline"></span>
     </header>
 
@@ -351,6 +351,7 @@ onMounted(() => isManager ? (adminKey.value && login()) : loadPoll())
 
       <header class="report-hero">
         <div>
+          <span class="brand-logo report-logo"><img src="/kids-hub-logo.png" alt="Kids Hub"></span>
           <span class="report-kicker">Підсумки опитування · {{ reportDate }}</span>
           <h1>{{ reportPoll.title }}</h1>
           <p v-if="reportPoll.description">{{ reportPoll.description }}</p>
@@ -410,7 +411,7 @@ onMounted(() => isManager ? (adminKey.value && login()) : loadPoll())
         </div>
       </section>
 
-      <footer class="report-footer"><strong>Тиц<span>!</span></strong><p>Kids Hub · {{ reportDate }}</p></footer>
+      <footer class="report-footer"><span class="brand-logo report-footer-logo"><img src="/kids-hub-logo.png" alt="Kids Hub"></span><p>Kids Hub · {{ reportDate }}</p></footer>
     </section>
 
     <section v-else-if="isStats" class="center-state">{{ message || 'Готую статистику…' }}</section>
